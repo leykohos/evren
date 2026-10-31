@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# evren — EVREN LLM altyapısı üzerinde çalışan yapay zekâ ajanı.
+# Claude Code arayüzünü EVREN'in Anthropic uyumlu ucuna (/v1/messages)
+# yönlendirir; beyni senin seçtiğin EVREN modeli olur. Anthropic/Claude
+# kotası HARCANMAZ — istekler EVREN'e gider.
+#
+# Fatih Muhammet Bahçıvan tarafından hazırlanmıştır.
+set -euo pipefail
+
+BASE="https://evren-llmapi.ssyz.org.tr"
+KEY_FILE="${EVREN_KEY_FILE:-$HOME/.config/evren/key}"
+VARSAYILAN_MODEL="glm-5.3"
+HAIKU_MODEL="${EVREN_HAIKU_MODEL:-qwen3.8-flash-next}"
+
+c_reset=$'\033[0m'; c_cyan=$'\033[36m'; c_dim=$'\033[2m'; c_bold=$'\033[1m'
+c_yellow=$'\033[33m'; c_green=$'\033[32m'; c_red=$'\033[31m'
+
+banner() {
+  printf '%s' "$c_cyan"
+  cat <<'B'
+   ███████╗██╗   ██╗██████╗ ███████╗███╗   ██╗
+   ██╔════╝██║   ██║██╔══██╗██╔════╝████╗  ██║
+   █████╗  ██║   ██║██████╔╝█████╗  ██╔██╗ ██║
+   ██╔══╝  ╚██╗ ██╔╝██╔══██╗██╔══╝  ██║╚██╗██║
+   ███████╗ ╚████╔╝ ██║  ██║███████╗██║ ╚████║
+   ╚══════╝  ╚═══╝  ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝
+B
+  printf '%s' "$c_reset"
+  printf '   %sEVREN altyapısı üzerinde yapay zekâ ajanı%s\n' "$c_bold" "$c_reset"
+  printf '   %sFatih Muhammet Bahçıvan tarafından hazırlanmıştır%s\n\n' "$c_dim" "$c_reset"
+}
+
+yardim() {
+  cat <<Y
+evren — EVREN üzerinde yapay zekâ ajanı (Fatih Muhammet Bahçıvan)
+
+Kullanım:
+  evren                      İnteraktif: model menüsünden seç ve başla
+  evren <model>              Doğrudan o modelle başla (ör. evren glm-5.3)
+  evren --list               Tüm modelleri listele
+  evren --anahtar            API anahtarını değiştir
+  evren --help               Bu yardım
+
+Anahtar: $KEY_FILE  (yalnız sende, dışarı gitmez)
+Not: Çalışırken Anthropic/Claude kotası HARCANMAZ; istekler EVREN'e gider.
+Y
+}
+
+# API anahtarını doğrular. Yazdırır: ok | terms | invalid | neterr
+dogrula() {
+  local out code body
+  out="$(curl -s -m 20 -w $'\n%{http_code}' "$BASE/v1/models" -H "X-API-Key: $1" 2>/dev/null)" || { echo neterr; return; }
+  code="${out##*$'\n'}"; body="${out%$'\n'*}"
+  if [[ "$code" == 200 ]]; then echo ok
+  elif printf '%s' "$body" | grep -q terms_not_accepted; then echo terms
+  else echo invalid; fi
+}
+
+# Anahtarı al, doğrula, gerekirse şartları kabul ettir, kaydet. Geçerli anahtarı
+# global KEY değişkenine koyar.
+KEY=""
+anahtar_hazirla() {
+  local zorla="${1:-}"
+  [[ -z "$zorla" && -s "$KEY_FILE" ]] && KEY="$(cat "$KEY_FILE")"
+  while true; do
+    if [[ -z "$KEY" ]]; then
+      printf '   %sEVREN API anahtarınızı girin%s (%s/api-keys):\n' "$c_bold" "$c_reset" "$BASE"
+      printf '   > '
+      IFS= read -r KEY || { echo; exit 1; }
+      KEY="${KEY//[[:space:]]/}"
+    fi
+    [[ -z "$KEY" ]] && { printf '   %sBoş anahtar.%s\n' "$c_red" "$c_reset"; continue; }
+    printf '   Doğrulanıyor…\r'
+    case "$(dogrula "$KEY")" in
+      ok)
+        mkdir -p "$(dirname "$KEY_FILE")"; printf '%s' "$KEY" > "$KEY_FILE"; chmod 600 "$KEY_FILE"
+        printf '   %s✓ Anahtar doğrulandı.%s      \n' "$c_green" "$c_reset"; return 0 ;;
+      terms)
+        printf '   %sKullanım şartları (v1) henüz kabul edilmemiş.%s\n' "$c_yellow" "$c_reset"
+        printf '   Metin: %s/v1/terms/text\n' "$BASE"
+        printf '   Şartları kabul ediyor musunuz? (e/h): '
+        local ans; IFS= read -r ans || exit 1
+        if [[ "$ans" == e* || "$ans" == E* ]]; then
+          if curl -s -m 20 -X POST "$BASE/v1/terms/accept" -H "X-API-Key: $KEY" \
+               -H "Content-Type: application/json" -d '{"version":1}' | grep -q accepted_version; then
+            mkdir -p "$(dirname "$KEY_FILE")"; printf '%s' "$KEY" > "$KEY_FILE"; chmod 600 "$KEY_FILE"
+            printf '   %s✓ Şartlar kabul edildi, anahtar kaydedildi.%s\n' "$c_green" "$c_reset"; return 0
+          else
+            printf '   %sŞartlar kabul edilemedi.%s\n' "$c_red" "$c_reset"; KEY=""
+          fi
+        else
+          printf '   %sŞartlar kabul edilmeden kullanılamaz.%s\n' "$c_red" "$c_reset"; exit 1
+        fi ;;
+      invalid)
+        printf '   %s✗ Anahtar geçersiz. Tekrar deneyin.%s\n' "$c_red" "$c_reset"; KEY="" ;;
+      *)
+        printf '   %sAğ hatası — internet/erişim kontrol edin.%s\n' "$c_red" "$c_reset"; exit 1 ;;
+    esac
+  done
+}
+
+# Tüm modelleri yazdırır (sohbet olanlar seçilebilir, diğerleri bilgi amaçlı).
+modelleri_listele() {
+  curl -s -m 20 "$BASE/v1/models" -H "X-API-Key: $KEY" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+if 'data' not in d:
+    print('   (liste alınamadı)'); sys.exit(1)
+sohbet=[m for m in d['data'] if m.get('task') in ('chat','vision_chat')]
+diger=[m for m in d['data'] if m.get('task') not in ('chat','vision_chat')]
+print('   Ajan modelleri (sohbet):')
+for i,m in enumerate(sohbet,1):
+    print(f'     {i:>2}) {m[\"id\"]:<22} {m.get(\"task\")}')
+print()
+print('   Diğer modeller (yalnız API — ajan değil):')
+for m in diger:
+    print(f'        -  {m[\"id\"]:<22} {m.get(\"task\")}')
+"
+}
+
+# Seçilebilir sohbet modellerini (id) global SOHBET dizisine doldurur.
+SOHBET=()
+sohbet_modelleri_yukle() {
+  local ids
+  ids="$(curl -s -m 20 "$BASE/v1/models" -H "X-API-Key: $KEY" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for m in d.get('data',[]):
+    if m.get('task') in ('chat','vision_chat'):
+        print(m['id'])
+")"
+  SOHBET=()
+  while IFS= read -r l; do [[ -n "$l" ]] && SOHBET+=("$l"); done <<< "$ids"
+}
+
+# ───────── argümanlar ─────────
+case "${1:-}" in
+  -h|--help|yardim) yardim; exit 0 ;;
+  -l|--list|--models|modeller)
+    anahtar_hazirla; modelleri_listele; exit 0 ;;
+  --anahtar|--key)
+    banner; anahtar_hazirla zorla; echo "   Anahtar güncellendi."; exit 0 ;;
+esac
+
+banner
+anahtar_hazirla
+
+# Doğrudan model verildiyse menüyü atla.
+MODEL=""
+if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
+  MODEL="$1"; shift
+else
+  sohbet_modelleri_yukle
+  if [[ ${#SOHBET[@]} -eq 0 ]]; then
+    MODEL="$VARSAYILAN_MODEL"
+  else
+    echo "   Ajan modeli seçin:"
+    varsayilan_no=1
+    for i in "${!SOHBET[@]}"; do
+      m="${SOHBET[$i]}"
+      [[ "$m" == "$VARSAYILAN_MODEL" ]] && varsayilan_no=$((i+1))
+      printf '     %s%2d)%s %s\n' "$c_bold" $((i+1)) "$c_reset" "$m"
+    done
+    printf '   Seçim [1-%d, boş=%s]: ' "${#SOHBET[@]}" "$VARSAYILAN_MODEL"
+    IFS= read -r sec || exit 1
+    if [[ -z "$sec" ]]; then MODEL="$VARSAYILAN_MODEL"
+    elif [[ "$sec" =~ ^[0-9]+$ ]] && (( sec>=1 && sec<=${#SOHBET[@]} )); then MODEL="${SOHBET[$((sec-1))]}"
+    else MODEL="$sec"; fi
+  fi
+fi
+
+printf '\n   %s▸ EVREN ajanı başlıyor%s — model: %s%s%s  (çıkış: /exit)\n\n' \
+  "$c_green" "$c_reset" "$c_bold" "$MODEL" "$c_reset"
+
+# Env'ler yalnız bu komuta geçer; normal "claude" oturumların etkilenmez.
+ANTHROPIC_BASE_URL="$BASE" \
+ANTHROPIC_AUTH_TOKEN="$KEY" \
+ANTHROPIC_MODEL="$MODEL" \
+ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
+ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="$HAIKU_MODEL" \
+CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+exec claude "$@"
